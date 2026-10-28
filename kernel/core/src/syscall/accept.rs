@@ -4,7 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::file::{
         CreationFlags, StatusFlags,
-        file_table::{FdFlags, RawFileDesc, get_file_fast},
+        file_table::{FdFlags, FileDesc, RawFileDesc, get_file_fast},
     },
     prelude::*,
     util::net::write_socket_addr_to_user,
@@ -46,13 +46,55 @@ fn do_accept(
     flags: Flags,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let mut file_table = ctx.thread_local.borrow_file_table_mut();
-    let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
-    let socket = file.as_socket_or_err()?;
+    let fd_flags = if flags.contains(Flags::SOCK_CLOEXEC) {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
 
-    let is_nonblocking = flags.contains(Flags::SOCK_NONBLOCK);
+    // Reserve before dequeuing, as Linux does: `accept` removes the connection
+    // from the listen queue, so a later failure would drop it.
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/net/socket/accept.c#L40-L60>
+    let reserved_fd = {
+        let file_table = ctx.thread_local.borrow_file_table();
+        file_table.unwrap().write().reserve(fd_flags)?
+    };
+
+    let result = accept_into_reserved(
+        sockfd,
+        sockaddr_ptr,
+        addrlen_ptr,
+        flags.contains(Flags::SOCK_NONBLOCK),
+        reserved_fd,
+        fd_flags,
+        ctx,
+    );
+
+    if result.is_err() {
+        let mut file_table_ref = ctx.thread_local.borrow_file_table_mut();
+        let mut file_table_locked = file_table_ref.unwrap().write();
+        file_table_locked.close_file(reserved_fd);
+    }
+
+    result?;
+    Ok(SyscallReturn::Return(reserved_fd.into()))
+}
+
+/// Accepts into `reserved_fd`.
+fn accept_into_reserved(
+    sockfd: RawFileDesc,
+    sockaddr_ptr: Vaddr,
+    addrlen_ptr: Vaddr,
+    is_nonblocking: bool,
+    reserved_fd: FileDesc,
+    fd_flags: FdFlags,
+    ctx: &Context,
+) -> Result<()> {
+    let mut file_table = ctx.thread_local.borrow_file_table_mut();
 
     let (connected_socket, socket_addr) = {
+        let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
+        let socket = file.as_socket_or_err()?;
         socket
             .accept(is_nonblocking)
             .map_err(|err| match err.error() {
@@ -62,22 +104,15 @@ fn do_accept(
             })?
     };
 
-    let fd_flags = if flags.contains(Flags::SOCK_CLOEXEC) {
-        FdFlags::CLOEXEC
-    } else {
-        FdFlags::empty()
-    };
-
     if sockaddr_ptr != 0 {
         write_socket_addr_to_user(&socket_addr, sockaddr_ptr, addrlen_ptr)?;
     }
 
-    let fd = {
-        let mut file_table_locked = file_table.unwrap().write();
-        file_table_locked.insert(connected_socket, fd_flags)
-    };
-
-    Ok(SyscallReturn::Return(fd.into()))
+    file_table
+        .unwrap()
+        .write()
+        .install(reserved_fd, connected_socket);
+    Ok(())
 }
 
 bitflags! {

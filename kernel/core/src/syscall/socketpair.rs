@@ -53,19 +53,33 @@ pub(super) fn sys_socketpair(
         ),
     };
 
-    let socket_fds = {
+    let fd_flags = if sock_flags.contains(SockFlags::SOCK_CLOEXEC) {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
+
+    // Reserve first, install after the copy, so a failed copy leaks nothing.
+    let (fd_a, fd_b) = {
         let file_table = ctx.thread_local.borrow_file_table();
         let mut file_table_locked = file_table.unwrap().write();
-        let fd_flags = if sock_flags.contains(SockFlags::SOCK_CLOEXEC) {
-            FdFlags::CLOEXEC
-        } else {
-            FdFlags::empty()
-        };
-        let fd_a = file_table_locked.insert(socket_a, fd_flags);
-        let fd_b = file_table_locked.insert(socket_b, fd_flags);
-        SocketFds(fd_a.into(), fd_b.into())
+        file_table_locked.reserve_pair(fd_flags)?
     };
-    ctx.user_space().write_val(sv, &socket_fds)?;
+
+    let socket_fds = SocketFds(fd_a.into(), fd_b.into());
+    if let Err(err) = ctx.user_space().write_val(sv, &socket_fds) {
+        let file_table = ctx.thread_local.borrow_file_table();
+        let mut file_table_locked = file_table.unwrap().write();
+        file_table_locked.close_file(fd_a);
+        file_table_locked.close_file(fd_b);
+        return Err(err.into());
+    }
+
+    {
+        let file_table = ctx.thread_local.borrow_file_table();
+        let mut file_table_locked = file_table.unwrap().write();
+        file_table_locked.install_pair(fd_a, socket_a, fd_b, socket_b);
+    }
 
     Ok(SyscallReturn::Return(0))
 }

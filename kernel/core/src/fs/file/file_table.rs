@@ -10,7 +10,12 @@ use ostd::sync::RwArc;
 
 use super::file_handle::FileLike;
 use crate::{
-    fs::vfs::range_lock::RangeLockOwner, prelude::*, process::posix_thread::FileTableRefMut,
+    fs::vfs::range_lock::RangeLockOwner,
+    prelude::*,
+    process::{
+        ResourceType,
+        posix_thread::{AsPosixThread, FileTableRefMut},
+    },
 };
 
 /// Represents a validated, non-negative file descriptor.
@@ -160,6 +165,15 @@ impl FileTable {
         };
 
         let min_free_fd = get_min_free_fd();
+        // `F_DUPFD` is subject to `RLIMIT_NOFILE` too, even with a floor at or
+        // beyond the limit. Reference:
+        // <https://elixir.bootlin.com/linux/v6.16.9/source/fs/file.c#L548-L568>
+        if min_free_fd >= current_nofile_limit() {
+            return_errno_with_message!(
+                Errno::EMFILE,
+                "the per-process file descriptor limit is reached"
+            );
+        }
         self.table.put_at(min_free_fd, entry);
         // Resource limits guarantee the table never exceeds `i32::MAX` entries.
         Ok((min_free_fd as RawFileDesc).try_into().unwrap())
@@ -182,27 +196,90 @@ impl FileTable {
         let file = self
             .table
             .get(fd.into())
-            .map(|entry| entry.file.clone())
+            .map(|entry| entry.installed_file().cloned())
+            .and_then(|file| file)
             .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))?;
         Ok(FileTableEntry::new(file, flags))
     }
 
-    pub(crate) fn insert(&mut self, item: Arc<dyn FileLike>, flags: FdFlags) -> FileDesc {
+    /// Inserts a file into the table, returning `EMFILE` when the descriptor
+    /// would reach the soft `RLIMIT_NOFILE` limit, as Linux's `alloc_fd` does.
+    /// Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/fs/file.c#L548-L568>
+    pub(crate) fn insert(&mut self, item: Arc<dyn FileLike>, flags: FdFlags) -> Result<FileDesc> {
+        let limit = current_nofile_limit();
+        let entry = FileTableEntry::new(item, flags);
+        let Some(raw_fd) = self.table.put_below(entry, limit) else {
+            return_errno_with_message!(
+                Errno::EMFILE,
+                "the per-process file descriptor limit is reached"
+            );
+        };
+        // Resource limits guarantee the table never exceeds `i32::MAX` entries.
+        Ok((raw_fd as RawFileDesc).try_into().unwrap())
+    }
+
+    /// Inserts a file without consulting `RLIMIT_NOFILE`; only for kernel-side
+    /// wiring that runs before any user process exists (stdin/stdout/stderr).
+    pub(crate) fn insert_force(&mut self, item: Arc<dyn FileLike>, flags: FdFlags) -> FileDesc {
         let entry = FileTableEntry::new(item, flags);
         // Resource limits guarantee the table never exceeds `i32::MAX` entries.
         (self.table.put(entry) as RawFileDesc).try_into().unwrap()
     }
 
+    /// Reserves a descriptor (Linux's `get_unused_fd_flags`), so a caller can
+    /// secure the budget before its side effect and race-free against threads
+    /// sharing the table. Unusable until [`Self::install`].
+    /// Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/fs/file.c#L1250-L1270>
+    pub(crate) fn reserve(&mut self, flags: FdFlags) -> Result<FileDesc> {
+        let entry = FileTableEntry::reserved(flags);
+        let Some(raw_fd) = self.table.put_below(entry, current_nofile_limit()) else {
+            return_errno_with_message!(
+                Errno::EMFILE,
+                "the per-process file descriptor limit is reached"
+            );
+        };
+        // Resource limits guarantee the table never exceeds `i32::MAX` entries.
+        Ok((raw_fd as RawFileDesc).try_into().unwrap())
+    }
+
+    pub(crate) fn install(&mut self, fd: FileDesc, file: Arc<dyn FileLike>) {
+        let entry = self
+            .table
+            .get_mut(fd.into())
+            .expect("the reserved descriptor must exist");
+        entry.install(file);
+    }
+
+    pub(crate) fn reserve_pair(&mut self, flags: FdFlags) -> Result<(FileDesc, FileDesc)> {
+        let first = self.reserve(flags)?;
+        match self.reserve(flags) {
+            Ok(second) => Ok((first, second)),
+            Err(e) => {
+                self.table.remove(first.into());
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn install_pair(
+        &mut self,
+        first: FileDesc,
+        first_file: Arc<dyn FileLike>,
+        second: FileDesc,
+        second_file: Arc<dyn FileLike>,
+    ) {
+        self.install(first, first_file);
+        self.install(second, second_file);
+    }
+
     pub(crate) fn close_file(&mut self, fd: FileDesc) -> Option<ClosedFile> {
         let removed_entry = self.table.remove(fd.into())?;
+        let file = removed_entry.file?;
         // POSIX record locks are process-associated and Linux drops them when any fd for the inode is
         // closed by that process, even if duplicated descriptors still exist.
         //
         // Reference: <https://man7.org/linux/man-pages/man2/fcntl_locking.2.html>
-        Some(ClosedFile::new(
-            removed_entry.file,
-            self.as_range_lock_owner(),
-        ))
+        Some(ClosedFile::new(file, self.as_range_lock_owner()))
     }
 
     pub(crate) fn close_files_on_exec(&mut self) -> Vec<ClosedFile> {
@@ -228,7 +305,9 @@ impl FileTable {
             .collect();
 
         for fd in closed_fds {
-            closed_files.push(self.close_file(fd).unwrap());
+            if let Some(closed_file) = self.close_file(fd) {
+                closed_files.push(closed_file);
+            }
         }
 
         closed_files
@@ -237,27 +316,38 @@ impl FileTable {
     pub(crate) fn get_file(&self, fd: FileDesc) -> Result<&Arc<dyn FileLike>> {
         self.table
             .get(fd.into())
-            .map(|entry| entry.file())
+            .and_then(|entry| entry.installed_file())
             .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))
     }
 
     pub(crate) fn get_entry(&self, fd: FileDesc) -> Result<&FileTableEntry> {
-        self.table
+        let entry = self
+            .table
             .get(fd.into())
-            .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))
+            .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))?;
+        if entry.installed_file().is_none() {
+            return_errno_with_message!(Errno::EBADF, "the FD is not installed yet");
+        }
+        Ok(entry)
     }
 
     pub(crate) fn get_entry_mut(&mut self, fd: FileDesc) -> Result<&mut FileTableEntry> {
-        self.table
+        let entry = self
+            .table
             .get_mut(fd.into())
-            .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))
+            .ok_or_else(|| Error::with_message(Errno::EBADF, "the FD does not exist"))?;
+        if entry.installed_file().is_none() {
+            return_errno_with_message!(Errno::EBADF, "the FD is not installed yet");
+        }
+        Ok(entry)
     }
 
     pub(crate) fn fds_and_files(&self) -> impl Iterator<Item = (FileDesc, &'_ Arc<dyn FileLike>)> {
         // Resource limits guarantee the table never exceeds `i32::MAX` entries.
         self.table
             .idxes_and_items()
-            .map(|(idx, entry)| ((idx as RawFileDesc).try_into().unwrap(), entry.file()))
+            .filter_map(|(idx, entry)| entry.installed_file().map(|file| (idx, file)))
+            .map(|(idx, file)| ((idx as RawFileDesc).try_into().unwrap(), file))
     }
 }
 
@@ -365,20 +455,44 @@ macro_rules! get_file_fast {
 pub(crate) use get_file_fast;
 
 pub(crate) struct FileTableEntry {
-    file: Arc<dyn FileLike>,
+    /// `None` while the descriptor is reserved but the file has not been
+    /// installed yet (see [`FileTable::reserve`]). A reserved descriptor is
+    /// not usable by user space.
+    file: Option<Arc<dyn FileLike>>,
     flags: AtomicU8,
 }
 
 impl FileTableEntry {
     pub(crate) fn new(file: Arc<dyn FileLike>, flags: FdFlags) -> Self {
         Self {
-            file,
+            file: Some(file),
             flags: AtomicU8::new(flags.bits()),
         }
     }
 
+    /// Creates a reserved entry that holds no file yet.
+    fn reserved(flags: FdFlags) -> Self {
+        Self {
+            file: None,
+            flags: AtomicU8::new(flags.bits()),
+        }
+    }
+
+    /// Installs the file of a reserved entry.
+    fn install(&mut self, file: Arc<dyn FileLike>) {
+        debug_assert!(self.file.is_none());
+        self.file = Some(file);
+    }
+
     pub(crate) fn file(&self) -> &Arc<dyn FileLike> {
-        &self.file
+        self.file
+            .as_ref()
+            .expect("a reserved descriptor has no file until it is installed")
+    }
+
+    /// Returns the file, or `None` if the descriptor is only reserved.
+    fn installed_file(&self) -> Option<&Arc<dyn FileLike>> {
+        self.file.as_ref()
     }
 
     pub(crate) fn flags(&self) -> FdFlags {
@@ -404,4 +518,21 @@ bitflags! {
         /// Close on exec
         const CLOEXEC = 1;
     }
+}
+
+/// Returns the soft `RLIMIT_NOFILE` limit of the current process.
+///
+/// Kernel threads have no process and are therefore not subject to the limit;
+/// they get `usize::MAX`.
+fn current_nofile_limit() -> usize {
+    let current = current_thread!();
+    let Some(posix_thread) = current.as_posix_thread() else {
+        return usize::MAX;
+    };
+    let process = posix_thread.process();
+    let resource_limits = process.resource_limits();
+    let limit = resource_limits
+        .get_rlimit(ResourceType::RLIMIT_NOFILE)
+        .get_cur();
+    limit as usize
 }

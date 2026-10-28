@@ -37,8 +37,9 @@ pub(super) fn sys_pipe2(fds: Vaddr, flags: u32, ctx: &Context) -> Result<Syscall
     let file_table = ctx.thread_local.borrow_file_table();
     let mut file_table_locked = file_table.unwrap().write();
 
-    let reader_fd = file_table_locked.insert(pipe_reader, fd_flags);
-    let writer_fd = file_table_locked.insert(pipe_writer, fd_flags);
+    // Reserve both descriptors first, as Linux does with
+    // `get_unused_fd_flags()`, so a full table fails before anything is visible.
+    let (reader_fd, writer_fd) = file_table_locked.reserve_pair(fd_flags)?;
     let pipe_fds = PipeFds {
         reader_raw_fd: reader_fd.into(),
         writer_raw_fd: writer_fd.into(),
@@ -49,17 +50,15 @@ pub(super) fn sys_pipe2(fds: Vaddr, flags: u32, ctx: &Context) -> Result<Syscall
     drop(file_table_locked);
 
     if let Err(err) = ctx.user_space().write_val(fds, &pipe_fds) {
-        // FIXME: Introduce reserved FDs to ensure that the files are never visible to user space
-        // before `write_val` succeeds and cleanup closes the exact reserved FDs below.
-        let closed_files = {
-            let mut file_table_locked = file_table.unwrap().write();
-            [
-                file_table_locked.close_file(reader_fd),
-                file_table_locked.close_file(writer_fd),
-            ]
-        };
-        drop(closed_files);
+        let mut file_table_locked = file_table.unwrap().write();
+        file_table_locked.close_file(reader_fd);
+        file_table_locked.close_file(writer_fd);
         return Err(err.into());
+    }
+
+    {
+        let mut file_table_locked = file_table.unwrap().write();
+        file_table_locked.install_pair(reader_fd, pipe_reader, writer_fd, pipe_writer);
     }
 
     Ok(SyscallReturn::Return(0))

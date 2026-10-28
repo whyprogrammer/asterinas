@@ -76,6 +76,30 @@ impl<T> SlotVec<T> {
         idx
     }
 
+    /// Puts an item into the lowest empty slot below `limit`.
+    ///
+    /// Returns `None` if every slot below `limit` is occupied, i.e. the item
+    /// cannot be stored without its index reaching `limit`.
+    pub fn put_below(&mut self, entry: T, limit: usize) -> Option<usize> {
+        let searchable = self.slots.len().min(limit);
+        if let Some(idx) = self.slots[..searchable]
+            .iter()
+            .position(|slot| slot.is_none())
+        {
+            self.slots[idx] = Some(entry);
+            self.num_occupied += 1;
+            return Some(idx);
+        }
+
+        if self.slots.len() >= limit {
+            return None;
+        }
+
+        self.slots.push(Some(entry));
+        self.num_occupied += 1;
+        Some(self.slots.len() - 1)
+    }
+
     /// Put and return the item at position `idx`.
     ///
     /// Return `None` if the item is not exist.

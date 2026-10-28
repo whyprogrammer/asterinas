@@ -31,15 +31,35 @@ pub(super) fn sys_openat(
         dirfd, path, flags, mode
     );
 
+    // Reserve before opening, as Linux does: otherwise `O_CREAT` would create a
+    // file that a later `EMFILE` abandons.
+    // Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/fs/open.c#L1446-L1460>
+    let fd_flags = if CreationFlags::from_bits_truncate(flags).contains(CreationFlags::O_CLOEXEC) {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
+    let reserved_fd = {
+        let file_table = ctx.thread_local.borrow_file_table();
+        file_table.unwrap().write().reserve(fd_flags)?
+    };
+
     let file_handle = {
         let path = path.to_string_lossy();
-        let fs_path = FsPath::from_fd_at(dirfd, path.as_ref(), EmptyPathStr::Reject)?;
+        let fs_path = match FsPath::from_fd_at(dirfd, path.as_ref(), EmptyPathStr::Reject) {
+            Ok(fs_path) => fs_path,
+            Err(e) => {
+                let file_table = ctx.thread_local.borrow_file_table();
+                file_table.unwrap().write().close_file(reserved_fd);
+                return Err(e);
+            }
+        };
 
         let fs_ref = ctx.thread_local.borrow_fs();
         let mask_mode = mode & !fs_ref.umask().get();
 
         let path_resolver = fs_ref.resolver().read();
-        do_open(
+        let opened = do_open(
             &path_resolver,
             &fs_path,
             flags,
@@ -48,20 +68,21 @@ pub(super) fn sys_openat(
         .map_err(|err| match err.error() {
             Errno::EINTR => Error::new(Errno::ERESTARTSYS),
             _ => err,
-        })?
+        });
+
+        if opened.is_err() {
+            let file_table = ctx.thread_local.borrow_file_table();
+            file_table.unwrap().write().close_file(reserved_fd);
+        }
+        opened?
     };
 
-    let fd = {
+    {
         let file_table = ctx.thread_local.borrow_file_table();
         let mut file_table_locked = file_table.unwrap().write();
-        let fd_flags =
-            if CreationFlags::from_bits_truncate(flags).contains(CreationFlags::O_CLOEXEC) {
-                FdFlags::CLOEXEC
-            } else {
-                FdFlags::empty()
-            };
-        file_table_locked.insert(file_handle.clone(), fd_flags)
-    };
+        file_table_locked.install(reserved_fd, file_handle.clone());
+    }
+    let fd = reserved_fd;
     fs::vfs::notify::on_open(file_handle.common());
     Ok(SyscallReturn::Return(fd.into()))
 }
